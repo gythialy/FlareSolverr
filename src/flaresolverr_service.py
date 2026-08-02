@@ -1,3 +1,4 @@
+import json
 import logging
 import platform
 import sys
@@ -5,7 +6,7 @@ import time
 from datetime import timedelta
 from html import escape
 from random import uniform
-from urllib.parse import unquote, quote
+from urllib.parse import unquote, quote, urlparse
 
 from func_timeout import FunctionTimedOut, func_timeout
 from selenium.common import TimeoutException
@@ -120,8 +121,8 @@ def _controller_v1_handler(req: V1RequestBase) -> V1ResponseBase:
     # do some validations
     if req.cmd is None:
         raise Exception("Request parameter 'cmd' is mandatory.")
-    if req.headers is not None:
-        logging.warning("Request parameter 'headers' was removed in FlareSolverr v2.")
+    if req.headers is not None and req.contentType != "json":
+        logging.warning("Request parameter 'headers' was removed in FlareSolverr v2 (only honored when contentType=\"json\").")
     if req.userAgent is not None:
         logging.warning("Request parameter 'userAgent' was removed in FlareSolverr v2.")
 
@@ -374,8 +375,13 @@ def _evil_logic(req: V1RequestBase, driver: WebDriver, method: str) -> Challenge
     logging.debug(f"Navigating to... {req.url}")
     turnstile_token = None
 
+    json_post_status = None
+    json_post_response = None
     if method == "POST":
-        _post_request(req, driver)
+        if req.contentType == "json":
+            json_post_status, json_post_response = _post_request_json(req, driver)
+        else:
+            _post_request(req, driver)
     else:
         if req.tabs_till_verify is None:
             driver.get(req.url)
@@ -390,7 +396,10 @@ def _evil_logic(req: V1RequestBase, driver: WebDriver, method: str) -> Challenge
             driver.add_cookie(cookie)
         # reload the page
         if method == 'POST':
-            _post_request(req, driver)
+            if req.contentType == "json":
+                json_post_status, json_post_response = _post_request_json(req, driver)
+            else:
+                _post_request(req, driver)
         else:
             driver.get(req.url)
 
@@ -472,7 +481,7 @@ def _evil_logic(req: V1RequestBase, driver: WebDriver, method: str) -> Challenge
 
     challenge_res = ChallengeResolutionResultT({})
     challenge_res.url = driver.current_url
-    challenge_res.status = 200  # todo: fix, selenium not provides this info
+    challenge_res.status = json_post_status if json_post_status is not None else 200
     challenge_res.userAgent = utils.get_user_agent(driver)
     challenge_res.turnstile_token = turnstile_token
 
@@ -483,7 +492,7 @@ def _evil_logic(req: V1RequestBase, driver: WebDriver, method: str) -> Challenge
             logging.info("Waiting " + str(req.waitInSeconds) + " seconds before returning the response...")
             time.sleep(req.waitInSeconds)
 
-        challenge_res.response = driver.page_source
+        challenge_res.response = json_post_response if json_post_response is not None else driver.page_source
 
     if req.returnScreenshot:
         challenge_res.screenshot = driver.get_screenshot_as_base64()
@@ -526,3 +535,59 @@ def _post_request(req: V1RequestBase, driver: WebDriver):
         </body>
         </html>"""
     driver.get("data:text/html;charset=utf-8,{html_content}".format(html_content=html_content))
+
+
+def _post_request_json(req: V1RequestBase, driver: WebDriver):
+    """Send a JSON POST request from the browser context with custom headers.
+
+    The classic request.post submits an HTML form (application/x-www-form-urlencoded,
+    no custom headers), which breaks JSON / GraphQL APIs. This variant sends the
+    request via the browser's fetch() so it carries a real browser TLS fingerprint
+    AND arbitrary headers (e.g. Apollo CSRF preflight headers) -- the only way to
+    reach bot-protected JSON APIs such as Cloudflare-protected GraphQL backends.
+    """
+    # navigate to the target origin first so fetch() is same-origin
+    parsed_url = urlparse(req.url or "")
+    if not parsed_url.scheme or not parsed_url.netloc:
+        raise Exception("Request parameter 'url' must be an absolute URL when contentType=\"json\".")
+    target_origin = parsed_url.scheme + "://" + parsed_url.netloc
+    current_url = ""
+    try:
+        current_url = driver.current_url or ""
+    except Exception:
+        # some webdrivers raise when there is no current page yet
+        pass
+    if not current_url.startswith(target_origin):
+        logging.debug(f"JSON POST: navigating to origin {target_origin}")
+        # navigate to the origin root (a plain GET to the full path may itself be
+        # protected / blocked); the JSON POST then goes out via same-origin fetch()
+        driver.get(target_origin + "/")
+
+    headers = dict(req.headers or {})
+    if "Content-Type" not in headers:
+        headers["Content-Type"] = "application/json"
+
+    # NOTE: arguments[last] is always the async callback; pass extra args in order
+    script = """
+        const done = arguments[arguments.length - 1];
+        fetch(arguments[0], {
+            method: 'POST',
+            headers: arguments[2],
+            body: arguments[1],
+            credentials: 'include'
+        })
+        .then(r => r.text().then(t => ({status: r.status, body: t})))
+        .then(res => done(JSON.stringify(res)))
+        .catch(e => done(JSON.stringify({status: 0, body: 'FETCH_ERROR: ' + e.message})));
+    """
+    result = driver.execute_async_script(script, req.url, req.postData or "", headers)
+    try:
+        parsed = json.loads(result) if isinstance(result, str) else result
+        http_status = int(parsed.get("status", 0))
+        body = parsed.get("body", "")
+        if http_status == 0:
+            logging.error(f"JSON POST fetch failed: {body}")
+    except Exception as e:
+        logging.error(f"JSON POST: unexpected result from browser: {result} ({e})")
+        http_status, body = 0, str(result)
+    return http_status, body

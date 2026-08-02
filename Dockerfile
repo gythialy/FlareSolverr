@@ -1,7 +1,10 @@
-FROM python:3.11-slim-bookworm AS builder
+# Build dummy packages on the build machine arch only (they are
+# arch-independent), so multi-arch builds don't run equivs per-platform.
+FROM --platform=$BUILDPLATFORM python:3.11-slim-bookworm AS builder
 
 # Build dummy packages to skip installing them and their dependencies
-RUN apt-get update \
+RUN --mount=type=cache,target=/var/cache/apt,sharing=locked \
+    apt-get update \
     && apt-get install -y --no-install-recommends equivs \
     && equivs-control libgl1-mesa-dri \
     && printf 'Section: misc\nPriority: optional\nStandards-Version: 3.9.2\nPackage: libgl1-mesa-dri\nVersion: 99.0.0\nDescription: Dummy package for libgl1-mesa-dri\n' >> libgl1-mesa-dri \
@@ -25,9 +28,11 @@ COPY --from=builder /*.deb /
 #    apt-cache madison chromium
 WORKDIR /app
     # Install dummy packages
-RUN dpkg -i /libgl1-mesa-dri.deb \
+RUN --mount=type=cache,target=/var/cache/apt,sharing=locked \
+    dpkg -i /libgl1-mesa-dri.deb \
     && dpkg -i /adwaita-icon-theme.deb \
-    # Install dependencies
+    # Install dependencies (apt archives cached via BuildKit mount, so
+    # repeated builds reuse downloaded .debs and skip the network)
     && apt-get update \
     && apt-get install -y --no-install-recommends chromium chromium-common chromium-driver xvfb dumb-init \
         procps curl vim xauth \
@@ -45,18 +50,27 @@ RUN dpkg -i /libgl1-mesa-dri.deb \
 
 VOLUME /config
 
-# Install Python dependencies
+# Install Python dependencies (pip download cache via BuildKit mount)
 COPY requirements.txt .
-RUN pip install -r requirements.txt \
-    # Remove temporary files
-    && rm -rf /root/.cache
+RUN --mount=type=cache,target=/root/.cache/pip,sharing=locked \
+    pip install -r requirements.txt
+
+# Copy source code. The JSON-POST support (contentType="json") lives in src/ itself;
+# patches/ now only documents how to derive a hot-patch for an upstream-built image.
+COPY src .
+COPY package.json ../
+# py_compile only proves the files parse. The undefined-name check below also
+# catches names that compile and import fine but raise NameError on first use
+# (e.g. an import dropped while resolving a fork/upstream merge conflict).
+COPY scripts/check_undefined_names.py /tmp/check_undefined_names.py
+RUN cd /app \
+    && python3 -m py_compile *.py bottle_plugins/*.py undetected_chromedriver/*.py \
+    && python3 /tmp/check_undefined_names.py *.py bottle_plugins/*.py undetected_chromedriver/*.py \
+    && rm -f /tmp/check_undefined_names.py
 
 USER flaresolverr
 
 RUN mkdir -p "/app/.config/chromium/Crash Reports/pending"
-
-COPY src .
-COPY package.json ../
 
 EXPOSE 8191
 EXPOSE 8192
