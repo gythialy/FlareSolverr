@@ -1,7 +1,10 @@
-FROM python:3.11-slim-bookworm AS builder
+# Build dummy packages on the build machine arch only (they are
+# arch-independent), so multi-arch builds don't run equivs per-platform.
+FROM --platform=$BUILDPLATFORM python:3.11-slim-bookworm AS builder
 
 # Build dummy packages to skip installing them and their dependencies
-RUN apt-get update \
+RUN --mount=type=cache,target=/var/cache/apt,sharing=locked \
+    apt-get update \
     && apt-get install -y --no-install-recommends equivs \
     && equivs-control libgl1-mesa-dri \
     && printf 'Section: misc\nPriority: optional\nStandards-Version: 3.9.2\nPackage: libgl1-mesa-dri\nVersion: 99.0.0\nDescription: Dummy package for libgl1-mesa-dri\n' >> libgl1-mesa-dri \
@@ -25,12 +28,14 @@ COPY --from=builder /*.deb /
 #    apt-cache madison chromium
 WORKDIR /app
     # Install dummy packages
-RUN dpkg -i /libgl1-mesa-dri.deb \
+RUN --mount=type=cache,target=/var/cache/apt,sharing=locked \
+    dpkg -i /libgl1-mesa-dri.deb \
     && dpkg -i /adwaita-icon-theme.deb \
-    # Install dependencies
+    # Install dependencies (apt archives cached via BuildKit mount, so
+    # repeated builds reuse downloaded .debs and skip the network)
     && apt-get update \
     && apt-get install -y --no-install-recommends chromium chromium-common chromium-driver xvfb dumb-init \
-        procps curl vim xauth \
+        procps curl vim xauth patch \
     # Remove temporary files and hardware decoding libraries
     && rm -rf /var/lib/apt/lists/* \
     && rm -f /usr/lib/x86_64-linux-gnu/libmfxhw* \
@@ -45,18 +50,22 @@ RUN dpkg -i /libgl1-mesa-dri.deb \
 
 VOLUME /config
 
-# Install Python dependencies
+# Install Python dependencies (pip download cache via BuildKit mount)
 COPY requirements.txt .
-RUN pip install -r requirements.txt \
-    # Remove temporary files
-    && rm -rf /root/.cache
+RUN --mount=type=cache,target=/root/.cache/pip,sharing=locked \
+    pip install -r requirements.txt
+
+# Copy source code and apply the JSON-POST patch (see patches/README.md)
+COPY src .
+COPY package.json ../
+COPY patches/flaresolverr-v3.5.0-json-post.patch /tmp/fs.patch
+RUN cd /app && patch -p0 < /tmp/fs.patch \
+    && python3 -m py_compile flaresolverr_service.py dtos.py \
+    && rm -f /tmp/fs.patch
 
 USER flaresolverr
 
 RUN mkdir -p "/app/.config/chromium/Crash Reports/pending"
-
-COPY src .
-COPY package.json ../
 
 EXPOSE 8191
 EXPOSE 8192
