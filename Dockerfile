@@ -30,7 +30,7 @@ RUN dpkg -i /libgl1-mesa-dri.deb \
     # Install dependencies
     && apt-get update \
     && apt-get install -y --no-install-recommends chromium chromium-common chromium-driver xvfb dumb-init \
-        procps curl vim xauth \
+        procps curl vim xauth patch \
     # Remove temporary files and hardware decoding libraries
     && rm -rf /var/lib/apt/lists/* \
     && rm -f /usr/lib/x86_64-linux-gnu/libmfxhw* \
@@ -51,12 +51,17 @@ RUN pip install -r requirements.txt \
     # Remove temporary files
     && rm -rf /root/.cache
 
+# Copy source code and apply the JSON-POST patch (see patches/README.md)
+COPY src .
+COPY package.json ../
+COPY patches/flaresolverr-v3.5.0-json-post.patch /tmp/fs.patch
+RUN cd /app && patch -p1 < /tmp/fs.patch \
+    && python3 -m py_compile flaresolverr_service.py dtos.py \
+    && rm -f /tmp/fs.patch
+
 USER flaresolverr
 
 RUN mkdir -p "/app/.config/chromium/Crash Reports/pending"
-
-COPY src .
-COPY package.json ../
 
 EXPOSE 8191
 EXPOSE 8192
