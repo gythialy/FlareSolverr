@@ -2,6 +2,8 @@ name: Docker release
 
 on:
   push:
+    branches:
+      - master
     tags:
       - "v*.*.*"
   pull_request:
@@ -28,7 +30,7 @@ jobs:
         uses: docker/metadata-action@v5
         with:
           images: |
-            ${{ env.REPOSITORY }},enable=${{ github.event_name != 'pull_request' }}
+            ${{ env.REPOSITORY }},enable=${{ secrets.DOCKERHUB_USERNAME != '' }}
             ghcr.io/${{ env.REPOSITORY }}
           tags: |
             type=semver,pattern={{version}},prefix=v
